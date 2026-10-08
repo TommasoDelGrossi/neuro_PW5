@@ -41,7 +41,6 @@ using namespace std::chrono;
 ml_stimulator p24_stimulator;
 bool P24_initialized = false;
 
-
 Smpt_device stim_device;
 Smpt_ml_init ml_init;
 Smpt_ml_update ml_update;
@@ -64,10 +63,10 @@ stimulator_mode_t stim_mode = STIM_WAIT;
 
 /* ── AllyArm Variables ────────────────────────────────────── */
 
-bool torque_axis[4] = {true, true, false, true}; // axis working with torque control
+bool torque_axis[4] = {false, false, false, true}; // axis working with torque control
 
 driver_working_mode_enum driver_position[4] = {POS_INT_PROFILER, POS_INT_PROFILER, POS_INT_PROFILER, POS_INT_PROFILER};
-driver_working_mode_enum driver_torque[4] = {TORQUE, TORQUE, STAND_STILL_AUTO, TORQUE};
+driver_working_mode_enum driver_torque[4] = {STAND_STILL_AUTO, STAND_STILL_AUTO, STAND_STILL_AUTO, TORQUE};
 driver_working_mode_enum driver_stop[4] = {SOFT_STOP, SOFT_STOP, SOFT_STOP, SOFT_STOP};
 driver_working_mode_enum driver_torque_calib[4] = {TORQUE, TORQUE, DRIVER_OFF, TORQUE};
 
@@ -116,6 +115,10 @@ bool stop_confirmed = false;
 
 bool positioning_active = false;
 bool position_mode_ready = false;
+bool position_reached = false;
+
+bool exercise_active = false;
+bool antig_90s_completed = false;
 
 /* ── Generic Variables ────────────────────────────────────── */
 
@@ -199,6 +202,8 @@ void loop()
 
             positioning_active = false;
             position_mode_ready = false;
+            position_reached = false;
+            exercise_active = false;
 
             // Disabilita ulteriori aggiornamenti FES
             stim_mode = STIM_WAIT;
@@ -300,7 +305,24 @@ void loop()
         break;
 
     case START_EXERCISE:
-        // Avvia la prova
+
+        if (position_reached &&
+            !positioning_active &&
+            !exercise_active &&
+            !stop_pressed)
+        {
+            exercise_active = true;
+            antig_90s_completed = false;
+
+            motion_sub_state = TO_TORQUE;
+
+            std::cout << "[EXO] Starting AntiG exercise...\n";
+        }
+        else
+        {
+            std::cout << "[WARNING] Exo not ready for AntiG!\n";
+        }
+
         break;
 
     case STOP_EXERCISE:
@@ -373,14 +395,45 @@ void loop()
         }
         else
         {
-            if (Ally.robotControl_Position(target_pos, 3000))   //movimento di setup dura 3 secondi
+            if (Ally.robotControl_Position(target_pos, 3000)) // movimento di setup dura 3 secondi
             {
                 positioning_active = false;
+                position_reached = true;
                 state_timer.reset();
 
                 std::cout << "[EXO] Target position reached!\n";
- 
             }
+        }
+    }
+
+    /*---------ANTIG CONTROL-------------*/
+
+    if (exercise_active && !stop_pressed)
+    {
+        switch (motion_sub_state)
+        {
+        case TO_TORQUE:
+            if (set_global_working_mode(driver_torque))
+                motion_sub_state = IMPEDANCE_CONTROL;
+            break;
+
+        case IMPEDANCE_CONTROL:
+            if (Ally.robotControl_AntiG(torque_axis, molla, 600000)) //qui si può sutomizzare la durata dell'esercizio. ripetizioni magari?
+                motion_sub_state = TO_POSITION;
+            break;
+
+        case TO_POSITION:
+            if (set_global_working_mode(driver_position))
+                motion_sub_state = SUBTASK_COMPLETE;
+            break;
+
+        case SUBTASK_COMPLETE:
+            antig_90s_completed = true;
+            motion_sub_state = TO_TORQUE;
+            break;
+
+        default:
+            break;
         }
     }
 
