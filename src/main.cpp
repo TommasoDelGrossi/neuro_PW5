@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <iomanip>
 #include <cmath>
+#include <atomic>
+#include <ctime>
 
 #include <cstdio>
 #include <cstdlib>
@@ -111,7 +113,7 @@ bool command_to_exo = false;
 int tick = 0;
 bool stop_pressed = false;
 bool stop_initialized = false;
-bool stop_confirmed = false;
+std::atomic<bool> stop_confirmed{false};
 
 bool positioning_active = false;
 bool position_mode_ready = false;
@@ -161,6 +163,7 @@ typedef enum
 } GUI_State;
 
 std::atomic<GUI_State> requested_button{DEFAULT};
+std::atomic<bool> stop_requested{false};
 
 GUI_State gui_button = DEFAULT;
 
@@ -171,6 +174,11 @@ void loop()
     update_polimi_axis_data();
 
     GUI_State gui_button = requested_button.exchange(DEFAULT);
+
+    if (stop_requested.exchange(false))
+    {
+        stop_pressed = true;
+    }
 
     // Ignore commands until Exo is enabled
     if (!init_flag &&
@@ -231,21 +239,6 @@ void loop()
             std::cout << "[STOP] Exo SOFT_STOP confirmed.\n";
         }
 
-        // Consenti ancora la chiusura del logger con EXIT
-        if (gui_button == EXIT)
-        {
-            init_flag = false;
-
-            if (logger != nullptr)
-            {
-                logger.reset();
-                std::cout << "[LOGGER] CSV closed.\n";
-            }
-
-            std::cout << "[SYSTEM] Press Ctrl+C to terminate.\n";
-        }
-
-        // Nessun altro controllo viene eseguito
         return;
     }
 
@@ -273,15 +266,14 @@ void loop()
 
     case GO_TO_POSITION:
 
-        if (!stop_pressed)
+        if (!positioning_active && !exercise_active && !stop_pressed)
         {
             positioning_active = true;
             position_mode_ready = false;
+            position_reached = false;
 
             command_to_exo = false;
             tick = 0;
-
-            state_timer.start();
 
             std::cout << "[EXO] Moving to start position\n";
         }
@@ -326,7 +318,7 @@ void loop()
         break;
 
     case STOP_EXERCISE:
-        stop_pressed = true; // Richiede arresto della prova
+        stop_requested = true; // Richiede arresto della prova
         break;
 
     case EXIT:
@@ -345,12 +337,6 @@ void loop()
     case DEFAULT:
         break;
     }
-
-    // else if (gui_button = ENABLE_EXO)
-    // {
-    //     anti_g_calib_flag = !anti_g_calib_flag;
-    //     printf("Anti-gravity calibration mode: %s\n", anti_g_calib_flag ? "ON" : "OFF");
-    // }
 
     // if (stim_flag)
     // {
@@ -418,7 +404,7 @@ void loop()
             break;
 
         case IMPEDANCE_CONTROL:
-            if (Ally.robotControl_AntiG(torque_axis, molla, 600000)) //qui si può sutomizzare la durata dell'esercizio. ripetizioni magari?
+            if (Ally.robotControl_AntiG(torque_axis, molla, 600000)) // qui si può sutomizzare la durata dell'esercizio. ripetizioni magari?
                 motion_sub_state = TO_POSITION;
             break;
 
@@ -428,6 +414,7 @@ void loop()
             break;
 
         case SUBTASK_COMPLETE:
+            exercise_active = false;
             antig_90s_completed = true;
             motion_sub_state = TO_TORQUE;
             break;
@@ -436,11 +423,6 @@ void loop()
             break;
         }
     }
-
-    // if (!boot_init_flag) // allo start, init exo in position
-    // {
-    //     boot_init_flag = set_global_working_mode(driver_stop);
-    // }
 
     // // ── Controllo stato stimolatore ──────────────
     // switch (stim_mode)
@@ -488,61 +470,6 @@ void loop()
     //     stim_mode = STIM_WAIT;
     //     break;
     // }
-
-    // /* ── EXECUTE current state ─────────────────────────── */
-    // switch (state)
-    // {
-
-    // case NOT_IN_GAME:
-
-    //     if (!manual_jog_active && !anti_g_calib_flag)
-    //     {
-    //         Ally.reset();
-    //         rest_timer.reset();
-    //         stim_timer.reset();
-    //         state_timer.reset();
-    //     }
-
-    //     if (anti_g_calib_flag)
-    //     {
-    //         printf("Anti-gravity calibration mode: ON\n");
-    //         switch (motion_sub_state)
-    //         {
-    //         case TO_TORQUE:
-    //             if (set_global_working_mode(driver_torque))
-    //                 motion_sub_state = IMPEDANCE_CONTROL;
-    //             break;
-
-    //         case IMPEDANCE_CONTROL:
-    //             if (Ally.robotControl_AntiG(torque_axis, molla, 600000)) //(int)(g_start_repetition_times[0] * 1000)   // 120000
-    //                 motion_sub_state = TO_POSITION;
-    //             break;
-
-    //         case TO_POSITION:
-    //             if (set_global_working_mode(driver_position))
-    //                 motion_sub_state = SUBTASK_COMPLETE;
-    //             break;
-
-    //         case SUBTASK_COMPLETE:
-    //             motion_sub_state = TO_TORQUE;
-    //             break;
-
-    //         default:
-    //             break;
-    //         }
-    //     }
-    // }
-    // compute_stimulation(state, mode, rep, motion_sub_state);
-
-    // if (stop_pressed)
-    // {
-    //     state = NOT_IN_GAME;
-    //     stop_pressed = 0;
-    //     anti_g_calib_flag = false;
-    // }
-    // break;
-
-    // // end advance switch */
 
     if (init_flag && logger != nullptr)
     {
@@ -651,11 +578,32 @@ void terminal_input()
         case TRAPEZOIDAL:
         case BIOMIMETIC:
         case START_EXERCISE:
-        case STOP_EXERCISE:
-        case EXIT:
 
             requested_button.store(
                 static_cast<GUI_State>(selection));
+            break;
+
+        case STOP_EXERCISE:
+
+            stop_requested = true;
+            break;
+
+        case EXIT:
+
+            if (!stop_confirmed.load())
+            {
+                std::cout << "[WARNING] Stop Exo first (command 8).\n";
+            }
+            else
+            {
+                if (logger != nullptr)
+                {
+                    logger.reset();
+                    std::cout << "[LOGGER] CSV closed.\n";
+                }
+
+                std::cout << "[SYSTEM] Press Ctrl+C to terminate.\n";
+            }
 
             break;
 
