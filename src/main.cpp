@@ -88,7 +88,7 @@ exofes::config::RobotConfig exo_config; // file di configurazione dell'exo con i
 
 molla_parameters_t molla;
 
-float target_pos[4] = {90.0f, 0.0f, 0.0f, 90.0f};
+float target_pos[4] = {90.0f, 0.0f, 90.0f, 90.0f};
 
 string profile; // aggiornato dal gioco, determina la modalità di assistenza (impedance_level)
 
@@ -540,6 +540,8 @@ void print_menu()
     std::cout << "\n--- Safe Exit ---\n";
     std::cout << "\n9 - EXIT\n";
 
+    std::cout << "\n \n \nSPACE + ENTER - SHOW COMMAND LIST\n";
+
     std::cout << "======================================\n";
 }
 
@@ -552,11 +554,17 @@ void terminal_input()
     while (true)
     {
 
-        std::cout << "\nSelect command: " << std::flush;
-
         if (!std::getline(std::cin, input))
         {
             break;
+        }
+
+        // SPACE + ENTER -> print menu
+        if (!input.empty() &&
+            input.find_first_not_of(" \t") == std::string::npos)
+        {
+            print_menu();
+            continue;
         }
 
         std::stringstream ss(input);
@@ -640,6 +648,9 @@ int main(void)
     printf("Shared memory reader started...\n");
 
     molla = get_molla_parameters();
+
+    if (molla.hand ==1)
+        target_pos[2] = -90.0f; // mano sinistra, pollice a 0°
 
     printf("Rigidezza: %f, Offset: %f, Mano: %d\n", molla.k, molla.offset, molla.hand);
 

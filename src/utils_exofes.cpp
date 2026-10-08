@@ -527,7 +527,7 @@ namespace exofes::control
     bool ExoController::robotControl_AntiG(bool active_axes[], molla_parameters_t molla, int duration_ms)
     {
         float tau4_g = 0, tau2_g = 0, AGS_torque = 0;
-        float antig_gain[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+        float antig_gain[4] = {0.0f, 1.0f, 0.0f, 0.5f};
         float tau_ref[4] = {0.0};
 
         float pos_rad_model[4] = {
