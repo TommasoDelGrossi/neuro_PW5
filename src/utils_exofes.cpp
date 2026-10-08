@@ -527,7 +527,7 @@ namespace exofes::control
     bool ExoController::robotControl_AntiG(bool active_axes[], molla_parameters_t molla, int duration_ms)
     {
         float tau4_g = 0, tau2_g = 0, AGS_torque = 0;
-        float antig_gain[4] = {0.0f, 0.5f, 0.0f, 0.3f};
+        float antig_gain[4] = {0.0f, 1.0f, 0.0f, 1.0f};
         float tau_ref[4] = {0.0};
 
         float pos_rad_model[4] = {
@@ -609,7 +609,7 @@ namespace exofes::control
     bool ExoController::robotControl_Impedance(bool active_axes[], float starting_pos[], float ending_pos[], int duration_ms, molla_parameters_t molla, const exofes::config::ImpedanceParams &profile, const float torque_limits[4])
     {
         float tau4_g = 0, tau2_g = 0, AGS_torque = 0;
-        float antig_gain[4] = {0.0f, 0.5f, 0.0f, 0.30f};
+        float antig_gain[4] = {0.0f, 1.0f, 0.0f, 1.0f};
         float target_pos[4], pos_error[4] = {0.0}, tau_ref_imp[4] = {0.0}, tau_ref[4] = {0.0};
 
         m_imp_timer.start(); // start timer

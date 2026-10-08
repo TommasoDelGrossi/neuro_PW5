@@ -39,6 +39,8 @@ using namespace std::chrono;
 
 /* ── P24 Variables ────────────────────────────────────── */
 ml_stimulator p24_stimulator;
+bool P24_initialized = false;
+
 
 Smpt_device stim_device;
 Smpt_ml_init ml_init;
@@ -85,7 +87,7 @@ exofes::config::RobotConfig exo_config; // file di configurazione dell'exo con i
 
 molla_parameters_t molla;
 
-float target_pos[4];
+float target_pos[4] = {90.0f, 0.0f, 0.0f, 90.0f};
 
 string profile; // aggiornato dal gioco, determina la modalità di assistenza (impedance_level)
 
@@ -109,6 +111,11 @@ std::string getProfile(int profile_id)
 bool command_to_exo = false;
 int tick = 0;
 bool stop_pressed = false;
+bool stop_initialized = false;
+bool stop_confirmed = false;
+
+bool positioning_active = false;
+bool position_mode_ready = false;
 
 /* ── Generic Variables ────────────────────────────────────── */
 
@@ -174,6 +181,69 @@ void loop()
         gui_button = DEFAULT;
     }
 
+    if (stop_pressed)
+    {
+        if (!stop_initialized)
+        {
+            // Reset delle variabili di movimento
+            command_to_exo = false;
+            tick = 0;
+
+            Ally.reset();
+
+            rest_timer.reset();
+            stim_timer.reset();
+            state_timer.reset();
+
+            motion_sub_state = TO_TORQUE;
+
+            positioning_active = false;
+            position_mode_ready = false;
+
+            // Disabilita ulteriori aggiornamenti FES
+            stim_mode = STIM_WAIT;
+
+            // Arresto Mid-Level dello stimolatore
+            if (P24_initialized)
+            {
+                if (!smpt_send_ml_stop(
+                        &p24_stimulator.stim_device,
+                        p24_stimulator.packet_number++))
+                {
+                    std::cerr << "[STOP] Error sending FES stop!\n";
+                }
+            }
+
+            stop_initialized = true;
+
+            std::cout << "[STOP] Stopping Exo and FES...\n";
+        }
+
+        // Continua la transizione dei driver finche' non e' completata
+        if (set_global_working_mode(driver_stop) && !stop_confirmed)
+        {
+            stop_confirmed = true;
+            std::cout << "[STOP] Exo SOFT_STOP confirmed.\n";
+        }
+
+        // Consenti ancora la chiusura del logger con EXIT
+        if (gui_button == EXIT)
+        {
+            init_flag = false;
+
+            if (logger != nullptr)
+            {
+                logger.reset();
+                std::cout << "[LOGGER] CSV closed.\n";
+            }
+
+            std::cout << "[SYSTEM] Press Ctrl+C to terminate.\n";
+        }
+
+        // Nessun altro controllo viene eseguito
+        return;
+    }
+
     switch (gui_button)
     {
 
@@ -197,7 +267,20 @@ void loop()
         break;
 
     case GO_TO_POSITION:
-        // Richiesta posizionamento [90, 0, 0, 90]
+
+        if (!stop_pressed)
+        {
+            positioning_active = true;
+            position_mode_ready = false;
+
+            command_to_exo = false;
+            tick = 0;
+
+            state_timer.start();
+
+            std::cout << "[EXO] Moving to start position\n";
+        }
+
         break;
 
     case ENABLE_FES:
@@ -221,7 +304,7 @@ void loop()
         break;
 
     case STOP_EXERCISE:
-        // Richiede arresto della prova
+        stop_pressed = true; // Richiede arresto della prova
         break;
 
     case EXIT:
@@ -259,25 +342,47 @@ void loop()
     //     // smpt_send_ml_stop(&p24_stimulator.stim_device, p24_stimulator.packet_number);
     // }
 
-    // update_polimi_axis_data();
+    if (master_data.on_target_position && command_to_exo)
+    {
+        tick++;
+        if (tick > 5)
+        {
+            command_to_exo = false; // ero già in target desiderato
+            // printf("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+            tick = 0;
+        }
+    }
 
-    // long int current_start_time = (long int)get_current_time_ms();
+    if (master_data.motion_ongoing == command_to_exo)
+    {
+        command_to_exo = false;
+    }
 
-    // if (master_data.on_target_position && command_to_exo)
-    // {
-    //     tick++;
-    //     if (tick > 5)
-    //     {
-    //         command_to_exo = false; // ero già in target desiderato
-    //         // printf("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-    //         tick = 0;
-    //     }
-    // }
+    /*-------- POSITION CONTROL -----------*/
 
-    // if (master_data.motion_ongoing == command_to_exo)
-    // {
-    //     command_to_exo = false;
-    // }
+    if (positioning_active && !stop_pressed)
+    {
+        if (!position_mode_ready)
+        {
+            if (set_global_working_mode(driver_position))
+            {
+                position_mode_ready = true;
+
+                std::cout << "[EXO] Position mode enabled\n";
+            }
+        }
+        else
+        {
+            if (Ally.robotControl_Position(target_pos, 3000))   //movimento di setup dura 3 secondi
+            {
+                positioning_active = false;
+                state_timer.reset();
+
+                std::cout << "[EXO] Target position reached!\n";
+ 
+            }
+        }
+    }
 
     // if (!boot_init_flag) // allo start, init exo in position
     // {
@@ -514,7 +619,7 @@ int main(void)
     p24_stimulator.stim_device = {0};
     smpt_open_serial_port(&p24_stimulator.stim_device, port_name);
 
-    bool P24_initialized = p24_stimulator.init_stimulation(&p24_stimulator.stim_device);
+    P24_initialized = p24_stimulator.init_stimulation(&p24_stimulator.stim_device);
 
     printf("P24 initialized: %s\n", P24_initialized ? "true" : "false");
 
@@ -538,13 +643,6 @@ int main(void)
     printf("Rigidezza: %f, Offset: %f, Mano: %d\n", molla.k, molla.offset, molla.hand);
 
     set_global_working_mode(driver_stop);
-
-    pid_t pid = fork();
-    if (pid < 0)
-    {
-        perror("fork failed");
-        return 1;
-    }
 
     print_menu();
 
