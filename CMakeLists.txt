@@ -25,6 +25,7 @@ add_executable(main
     src/data_logger.cpp
     src/timer.cpp
     src/grav_model.cpp
+    src/ml_stimulator.cpp
 
     ${SYSTEM_DIR}/utils.c
 )
