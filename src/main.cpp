@@ -11,6 +11,7 @@
 #include <cmath>
 #include <atomic>
 #include <ctime>
+#include <cerrno>
 
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include <signal.h>
 
 #include "smpt_ml_client.h"
+#include "smpt_messages.h"
 
 #include "utils.h"
 #include "utils_exofes.hpp"
@@ -41,7 +43,9 @@ using namespace std::chrono;
 
 /* ── P24 Variables ────────────────────────────────────── */
 ml_stimulator p24_stimulator;
-bool P24_initialized = false;
+bool P24_initialized = false; // Successful ML_Init send, not a device acknowledgement
+bool P24_port_open = false;   // Owns a descriptor; does not prove USB is still connected
+bool fes_reopen_before_stop = false; // Discard a failed transport before retrying STOP
 
 Smpt_device stim_device;
 Smpt_ml_init ml_init;
@@ -49,6 +53,8 @@ Smpt_ml_update ml_update;
 uint8_t packet_number = 0;
 
 double current[NUM_MUSCLES] = {0};
+// Original Codice_ok(2).zip: calculated stimulation commands, copied into current[] at each control tick.
+double stim_current[NUM_MUSCLES] = {0};
 double Imin[NUM_MUSCLES] = {10, 10, 10, 10, 10};
 double Imax[NUM_MUSCLES] = {20, 20, 20, 20, 20};
 
@@ -114,6 +120,12 @@ int tick = 0;
 bool stop_pressed = false;
 bool stop_initialized = false;
 std::atomic<bool> stop_confirmed{false};
+bool fes_stop_ok = true;
+
+// EXIT is acknowledged by loop() before the terminal destroys the logger.
+// Once requested, session closure cannot be cancelled by a restart command.
+bool session_closing = false; // Only accessed by loop()
+std::atomic<bool> logger_close_ready{false};
 
 bool positioning_active = false;
 bool position_mode_ready = false;
@@ -121,6 +133,33 @@ bool position_reached = false;
 
 bool exercise_active = false;
 bool antig_90s_completed = false;
+
+/* -- Rectangular FES pattern ------------------------------------------- */
+struct RectangularPatternConfig
+{
+    int channel = 1;          // Physical P24 channel, 1..5 (wrapper currently configures 5 channels)
+    double current_mA = 0.0;
+    double frequency_Hz = 30.0;
+    int pulse_width_us = 400;
+    int on_ms = 2000;
+    int off_ms = 3000;        // Default protocol: 1.5 * ON
+    int repetitions = 1;
+};
+
+enum RectangularState
+{
+    RECT_IDLE = 0,
+    RECT_ON,
+    RECT_OFF,
+    RECT_COMPLETE
+};
+
+RectangularPatternConfig rectangular_config;
+bool rectangular_configured = false;
+std::atomic<bool> rectangular_running{false};
+bool rectangular_phase_started = false;  // Only start the ON timer when AntiG is active.
+RectangularState rectangular_state = RECT_IDLE;
+int rectangular_rep = 0;
 
 /* ── Generic Variables ────────────────────────────────────── */
 
@@ -137,6 +176,8 @@ Timer stim_timer;       // cronometro per gestire i tempi di stimolazione
 Timer setup_timer;      // parte a stop game e aspetta 2 sec prima di riportare in resting position
 Timer correction_timer; // cronometro per gestire i tempi di correzione della posizione
 Timer state_timer;      // cronometro per gestire i tempi di ogni stato e subtask
+Timer rectangular_phase_timer;
+Timer p24_keepalive_timer;
 
 long long int start_time_ms;
 
@@ -169,6 +210,83 @@ GUI_State gui_button = DEFAULT;
 
 void compute_stimulation(int state, int mode, int rep, int motion_sub_state);
 
+// Diagnostic output only while sending ML_Init/ML_Stop. No serial polling is added.
+void report_fes_error(const char *message)
+{
+    const int saved_errno = errno;
+    std::cerr << "[FES / SMPT] " << message << "\n";
+    errno = saved_errno;
+}
+
+void ignore_fes_diagnostic(const char *)
+{
+}
+
+// Start with a fresh transport. This function sends no protocol commands.
+// Used before every new ML_Init and when recovering a failed STOP transport.
+bool reopen_p24_port()
+{
+    if (P24_port_open)
+    {
+        errno = 0;
+        const bool closed = smpt_close_serial_port(&p24_stimulator.stim_device);
+        const int close_errno = errno;
+        // Linux releases the descriptor even on a close error. Do not close it twice.
+        P24_port_open = false;
+        if (!closed)
+        {
+            stim_mode = STIM_ERROR;
+            std::cerr << "[FES] Serial close failed, errno=" << close_errno
+                      << ". Retry the requested command.\n";
+            return false;
+        }
+    }
+
+    p24_stimulator.stim_device = {0};
+    errno = 0;
+    P24_port_open = smpt_open_serial_port(
+        &p24_stimulator.stim_device, "/dev/P24");
+    const int open_errno = errno;
+
+    if (!P24_port_open)
+    {
+        stim_mode = STIM_ERROR;
+        std::cerr << "[FES] Cannot open /dev/P24, errno=" << open_errno
+                  << ". Check connection, then retry the requested command.\n";
+        return false;
+    }
+
+    fes_reopen_before_stop = false;
+    // Keep the protocol flag: a pending STOP is not completed by reopening.
+    return true;
+}
+
+
+// ML_Update is dispatched cyclically below, using the same STIM_ON / STIM_IDLE
+// logic and ml_stimulator::stimulate() call as the original working program.
+// In the original, STIM_ON copies stim_current[] to current[]; STIM_IDLE sends
+// all-zero currents. The rectangular FSM only determines which state applies.
+
+// Mid-Level requires ML_Get_Current_Data at least every 2 s after ML_Update.
+// We send it every 1 s while the rectangular sequence is active.
+bool send_p24_keepalive()
+{
+    Smpt_ml_get_current_data request{};
+    smpt_clear_ml_get_current_data(&request);
+    p24_stimulator.packet_number %= 64;
+    request.packet_number = p24_stimulator.packet_number++;
+    request.data_selection = Smpt_Ml_Data_Stimulation_Eight_Channels;
+
+    if (!smpt_send_ml_get_current_data(&p24_stimulator.stim_device, &request))
+    {
+        std::cerr << "[FES] ML_Get_Current_Data keep-alive failed. Requesting STOP.\n";
+        stim_mode = STIM_ERROR;
+        stop_requested.store(true);
+        return false;
+    }
+    return true;
+}
+
 void loop()
 {
     update_polimi_axis_data();
@@ -177,6 +295,19 @@ void loop()
 
     if (stop_requested.exchange(false))
     {
+        // A new STOP always wins over a pending movement command.
+        if (stop_pressed && !fes_stop_ok)
+            stop_initialized = false; // Explicit retry after an ML Stop send error
+
+        stop_pressed = true;
+        stop_confirmed.store(false);
+        if (gui_button != EXIT)
+            gui_button = DEFAULT;
+    }
+
+    if (gui_button == EXIT)
+    {
+        session_closing = true;
         stop_pressed = true;
     }
 
@@ -212,34 +343,134 @@ void loop()
             position_mode_ready = false;
             position_reached = false;
             exercise_active = false;
+            antig_90s_completed = false;
+            rectangular_running = false;
+            rectangular_phase_started = false;
+            rectangular_state = RECT_IDLE;
+            for (double &c : stim_current)
+                c = 0.0;
+            rectangular_rep = 0;
+            rectangular_phase_timer.reset();
+            p24_keepalive_timer.reset();
 
             // Disabilita ulteriori aggiornamenti FES
-            stim_mode = STIM_WAIT;
+            stim_mode = STIM_OFF;
 
-            // Arresto Mid-Level dello stimolatore
-            if (P24_initialized)
+            // ML Stop deinitializes stimulation; do not reinitialize it on Exo restart.
+            // This checks sending, not acknowledgement by the P24.
+            fes_stop_ok = !P24_initialized;
+            // At most one immediate reconnect/retry for a stale USB descriptor.
+            for (int attempt = 0; P24_initialized && attempt < 2; ++attempt)
             {
-                if (!smpt_send_ml_stop(
-                        &p24_stimulator.stim_device,
-                        p24_stimulator.packet_number++))
+                if (!P24_port_open || fes_reopen_before_stop)
                 {
-                    std::cerr << "[STOP] Error sending FES stop!\n";
+                    std::cout << "[FES STOP] Reopening /dev/P24 for STOP only; no ML_Init.\n";
+                    if (!reopen_p24_port())
+                        break; // STOP remains pending; another command 8 retries.
                 }
+
+                p24_stimulator.packet_number %= 64;
+                const uint8_t stop_packet = p24_stimulator.packet_number++;
+
+                smpt_init_error_callback(report_fes_error);
+                errno = 0;
+                fes_stop_ok = smpt_send_ml_stop(
+                    &p24_stimulator.stim_device, stop_packet);
+                const int stop_errno = errno;
+                // nullptr does not unregister callbacks in SMPT; use a no-op.
+                smpt_init_error_callback(ignore_fes_diagnostic);
+
+                if (fes_stop_ok)
+                {
+                    P24_initialized = false;
+                    stim_mode = STIM_OFF;
+                    std::cout << "[FES] ML_Stop sent. Use 3 to initialize FES again.\n";
+                }
+                else
+                {
+                    stim_mode = STIM_ERROR;
+                    std::cerr << "[FES STOP] packet=" << static_cast<unsigned>(stop_packet)
+                              << ", errno=" << stop_errno;
+                    if (stop_errno != 0)
+                        std::cerr << " (" << std::strerror(stop_errno) << ")";
+                    std::cerr << "\n";
+                    if (stop_errno == EIO || stop_errno == ENODEV)
+                    {
+                        fes_reopen_before_stop = true;
+                        if (attempt == 0)
+                        {
+                            std::cerr << "[FES STOP] Transport error. Reconnecting and retrying STOP once.\n";
+                            continue;
+                        }
+                    }
+                    std::cerr << "[STOP] FES stop send failed. Verify P24; command 8 retries.\n";
+                }
+                break;
             }
+            for (double &c : current)
+                c = 0.0;
 
             stop_initialized = true;
 
             std::cout << "[STOP] Stopping Exo and FES...\n";
         }
 
-        // Continua la transizione dei driver finche' non e' completata
-        if (set_global_working_mode(driver_stop) && !stop_confirmed)
+        // Complete the existing driver transition before accepting a restart.
+        if (!stop_confirmed.load())
         {
-            stop_confirmed = true;
-            std::cout << "[STOP] Exo SOFT_STOP confirmed.\n";
+            bool exo_stopped = set_global_working_mode(driver_stop);
+            if (exo_stopped && fes_stop_ok)
+            {
+                stop_confirmed.store(true);
+                std::cout << "[STOP] Exo SOFT_STOP confirmed; FES stop send handled.\n";
+                if (init_flag)
+                    std::cout << ">>> 2: reposition; 3: initialize FES; 9: close log (each + ENTER).\n";
+                else
+                    std::cout << ">>> 1 + ENTER: enable session; 9 + ENTER: close session.\n";
+            }
         }
 
-        return;
+        if (session_closing)
+        {
+            if (stop_confirmed.load())
+            {
+                init_flag = false;
+                // No later callback can reach logger or the control blocks.
+                logger_close_ready.store(true);
+            }
+            return;
+        }
+
+        const bool restart_position = (gui_button == GO_TO_POSITION && init_flag);
+        const bool enable_new_session = (gui_button == ENABLE_EXO && !init_flag);
+        const bool reinitialize_fes = (gui_button == ENABLE_FES && init_flag);
+
+        if (stop_confirmed.load() &&
+            (restart_position || enable_new_session || reinitialize_fes))
+        {
+            // Explicit restart: use the existing command cases below.
+            stop_confirmed.store(false);
+            stop_pressed = false;
+            stop_initialized = false;
+            if (restart_position)
+                std::cout << "[EXO] Restart requested. Repositioning before AntiG.\n";
+            else if (reinitialize_fes)
+                std::cout << "[FES] Reinitialization requested; Exo remains in SOFT_STOP.\n";
+        }
+        else
+        {
+            if (gui_button == GO_TO_POSITION || gui_button == START_EXERCISE ||
+                gui_button == ENABLE_FES)
+            {
+                if (!stop_confirmed.load())
+                    std::cout << "[WARNING] Wait for STOP confirmation.\n";
+                else if (!init_flag)
+                    std::cout << "[WARNING] No active log session. Restart the program.\n";
+                else
+                    std::cout << "[WARNING] After STOP, use 2 before 7.\n";
+            }
+            return;
+        }
     }
 
     switch (gui_button)
@@ -274,6 +505,8 @@ void loop()
 
             command_to_exo = false;
             tick = 0;
+            Ally.reset();
+            state_timer.reset();
 
             std::cout << "[EXO] Moving to start position\n";
         }
@@ -281,11 +514,54 @@ void loop()
         break;
 
     case ENABLE_FES:
-        // Richiesta abilitazione FES
+    {
+
+        if (P24_initialized)
+        {
+            std::cout << "[WARNING] FES already initialized. Command 3 ignored.\n";
+            break;
+        }
+
+        if (positioning_active || exercise_active)
+        {
+            std::cout << "[WARNING] Initialize FES before starting movement.\n";
+            break;
+        }
+
+        // Repeat the known-good clear -> open -> init_stimulation sequence.
+        // An old descriptor may refer to a deleted tty even if its flag is true.
+        if (!reopen_p24_port())
+            break;
+
+        p24_stimulator.packet_number %= 64;
+        smpt_init_error_callback(report_fes_error);
+        errno = 0;
+        P24_initialized = p24_stimulator.init_stimulation(
+            &p24_stimulator.stim_device);
+        const int init_errno = errno;
+        smpt_init_error_callback(ignore_fes_diagnostic);
+
+        if (P24_initialized)
+        {
+            for (double &c : current)
+                c = 0.0;
+            stim_mode = STIM_IDLE;
+            fes_stop_ok = false; // This new ML session needs a new STOP.
+            std::cout << "[FES] ML_Init sent. No stimulation requested.\n";
+        }
+        else
+        {
+            stim_mode = STIM_ERROR;
+            std::cerr << "[FES] ML_Init send failed, errno=" << init_errno
+                      << ". Check P24, then retry 3 (fresh connection).\n";
+        }
+
+        printf("P24 initialized: %s\n", P24_initialized ? "true" : "false");
         break;
+    }
 
     case RECTANGULAR:
-        // Seleziona pattern rettangolare
+        // Configuration is collected by terminal_input(). Nothing to execute in the RT callback.
         break;
 
     case TRAPEZOIDAL:
@@ -298,6 +574,17 @@ void loop()
 
     case START_EXERCISE:
 
+        if (!rectangular_configured)
+        {
+            std::cout << "[WARNING] Configure the rectangular pattern first (command 4).\n";
+            break;
+        }
+        if (!P24_initialized)
+        {
+            std::cout << "[WARNING] Initialize FES first (command 3).\n";
+            break;
+        }
+
         if (position_reached &&
             !positioning_active &&
             !exercise_active &&
@@ -307,7 +594,20 @@ void loop()
             antig_90s_completed = false;
 
             motion_sub_state = TO_TORQUE;
+            Ally.reset();
 
+            rectangular_running = true;
+            rectangular_phase_started = false;
+            rectangular_state = RECT_ON;
+            rectangular_rep = 1;
+            rectangular_phase_timer.reset();
+            p24_keepalive_timer.reset();
+            for (double &c : stim_current)
+                c = 0.0;
+
+            // Original execution order: enter AntiG first; then start sending
+            // cyclic ML_Updates once the torque-control state is reached.
+            stim_mode = STIM_WAIT;
             std::cout << "[EXO] Starting AntiG exercise...\n";
         }
         else
@@ -322,16 +622,7 @@ void loop()
         break;
 
     case EXIT:
-
-        init_flag = false;
-
-        if (logger != nullptr)
-        {
-            logger.reset(); // Call DataLogger destructor
-            std::cout << "[LOGGER] CSV closed.\n";
-        }
-
-        std::cout << "[SYSTEM] Press Ctrl+C to terminate.\n";
+        // Handled by the latched STOP/closure branch before this switch.
         break;
 
     case DEFAULT:
@@ -424,6 +715,113 @@ void loop()
         }
     }
 
+    /*--------- RECTANGULAR TIMING + ORIGINAL STIMULATION DISPATCH ---------*/
+    // Codice_ok(2).zip: the pattern logic sets stim_mode / stim_current;
+    // the control loop then sends ML_Update in STIM_ON and STIM_IDLE at every tick.
+    if (rectangular_running && !stop_pressed)
+    {
+        if (motion_sub_state == IMPEDANCE_CONTROL)
+        {
+            if (!rectangular_phase_started)
+            {
+                rectangular_phase_started = true;
+                for (double &c : stim_current)
+                    c = 0.0;
+                stim_current[rectangular_config.channel - 1] = rectangular_config.current_mA;
+                stim_mode = STIM_ON;
+                rectangular_phase_timer.start();
+                p24_keepalive_timer.start();
+                std::cout << "[FES] Rectangular pattern started: repetition 1/"
+                          << rectangular_config.repetitions << " (ON).\n";
+            }
+
+            if (rectangular_state == RECT_ON &&
+                rectangular_phase_timer.has_elapsed(rectangular_config.on_ms))
+            {
+                rectangular_state = RECT_OFF;
+                stim_mode = STIM_IDLE;
+                for (double &c : stim_current)
+                    c = 0.0;
+                rectangular_phase_timer.start();
+                std::cout << "[FES] Repetition " << rectangular_rep << "/"
+                          << rectangular_config.repetitions << " -> OFF.\n";
+            }
+            else if (rectangular_state == RECT_OFF &&
+                     rectangular_phase_timer.has_elapsed(rectangular_config.off_ms))
+            {
+                if (rectangular_rep >= rectangular_config.repetitions)
+                {
+                    rectangular_running = false;
+                    rectangular_phase_started = false;
+                    rectangular_state = RECT_COMPLETE;
+                    rectangular_phase_timer.reset();
+                    p24_keepalive_timer.reset();
+                    stim_mode = STIM_WAIT;
+                    for (double &c : current)
+                        c = 0.0;
+                    std::cout << "[FES] Rectangular pattern completed. FES remains initialized; AntiG continues.\n";
+                }
+                else
+                {
+                    ++rectangular_rep;
+                    rectangular_state = RECT_ON;
+                    stim_current[rectangular_config.channel - 1] = rectangular_config.current_mA;
+                    stim_mode = STIM_ON;
+                    rectangular_phase_timer.start();
+                    std::cout << "[FES] Repetition " << rectangular_rep << "/"
+                              << rectangular_config.repetitions << " -> ON.\n";
+                }
+            }
+
+            if (rectangular_running)
+            {
+                // Original STIM_ON/STIM_IDLE logic, adapted for a single J4 muscle.
+                // Each call to stimulate() builds one 3-point biphasic ML_Update.
+                if (stim_mode == STIM_ON)
+                {
+                    for (int i = 0; i < NUM_MUSCLES; ++i)
+                        current[i] = stim_current[i];
+                }
+                else // STIM_IDLE: all channels off while ML remains initialized
+                {
+                    for (int i = 0; i < NUM_MUSCLES; ++i)
+                        current[i] = 0.0;
+                }
+
+                const int period_ms = std::max(1, static_cast<int>(
+                    std::lround(1000.0 / rectangular_config.frequency_Hz)));
+                p24_stimulator.packet_number %= 64;
+                errno = 0;
+                const bool stimulation = p24_stimulator.stimulate(
+                    &p24_stimulator.stim_device,
+                    current, period_ms, rectangular_config.pulse_width_us);
+                const int update_errno = errno;
+
+                if (!stimulation)
+                {
+                    std::cerr << "[FES] Cyclic ML_Update failed (errno=" << update_errno;
+                    if (update_errno != 0)
+                        std::cerr << ", " << std::strerror(update_errno);
+                    std::cerr << "). Requesting STOP.\n";
+                    stim_mode = STIM_ERROR;
+                    stop_requested.store(true);
+                }
+                else if (p24_keepalive_timer.has_elapsed(1000))
+                {
+                    // Required by the bundled SMPT header; original program
+                    // did not explicitly issue ML_Get_Current_Data.
+                    send_p24_keepalive();
+                }
+            }
+        }
+        else if (rectangular_phase_started)
+        {
+            // If AntiG control exits unexpectedly, do not continue FES.
+            std::cerr << "[FES] AntiG is no longer active. Requesting STOP.\n";
+            stop_requested.store(true);
+        }
+    }
+
     // // ── Controllo stato stimolatore ──────────────
     // switch (stim_mode)
     // {
@@ -491,11 +889,8 @@ void loop()
                 polimi_axis_data[i].torque_Nm;
         }
 
-        // FES non ancora implementata
         for (int i = 0; i < 5; i++)
-        {
-            log_data.stim_current[i] = 0.0;
-        }
+            log_data.stim_current[i] = current[i];
 
         if (!logger->write(log_data))
         {
@@ -519,6 +914,89 @@ void loop()
 //     beta_patterns[mode] = pattern1;
 // }
 
+
+bool read_terminal_double(const std::string &prompt, double &value)
+{
+    std::string line;
+    std::cout << prompt;
+    if (!std::getline(std::cin, line))
+        return false;
+    std::stringstream ss(line);
+    char extra;
+    return (ss >> value) && !(ss >> extra);
+}
+
+bool read_terminal_int(const std::string &prompt, int &value)
+{
+    std::string line;
+    std::cout << prompt;
+    if (!std::getline(std::cin, line))
+        return false;
+    std::stringstream ss(line);
+    char extra;
+    return (ss >> value) && !(ss >> extra);
+}
+
+void configure_rectangular_pattern()
+{
+    if (rectangular_running.load())
+    {
+        std::cout << "[WARNING] Cannot reconfigure the rectangular pattern while it is running.\n";
+        return;
+    }
+
+    RectangularPatternConfig cfg;
+    double on_s = 0.0;
+
+    std::cout << "\n--- RECTANGULAR FES CONFIGURATION ---\n";
+    if (!read_terminal_int("Physical P24 channel [1-5]: ", cfg.channel) ||
+        cfg.channel < 1 || cfg.channel > 5)
+    {
+        std::cout << "[WARNING] Invalid channel. Configuration cancelled.\n";
+        return;
+    }
+    if (!read_terminal_double("Current [mA, >0 and <=150]: ", cfg.current_mA) ||
+        cfg.current_mA <= 0.0 || cfg.current_mA > 150.0)
+    {
+        std::cout << "[WARNING] Invalid current. Configuration cancelled.\n";
+        return;
+    }
+    if (!read_terminal_double("Frequency [Hz, >0 and <=1000]: ", cfg.frequency_Hz) ||
+        cfg.frequency_Hz <= 0.0 || cfg.frequency_Hz > 1000.0)
+    {
+        std::cout << "[WARNING] Invalid frequency. Configuration cancelled.\n";
+        return;
+    }
+    if (!read_terminal_int("Pulse width per phase [us, 10-4095]: ", cfg.pulse_width_us) ||
+        cfg.pulse_width_us < 10 || cfg.pulse_width_us > 4095)
+    {
+        std::cout << "[WARNING] Invalid pulse width. Configuration cancelled.\n";
+        return;
+    }
+    if (!read_terminal_double("ON duration [s, >0]: ", on_s) || on_s <= 0.0)
+    {
+        std::cout << "[WARNING] Invalid ON duration. Configuration cancelled.\n";
+        return;
+    }
+    if (!read_terminal_int("Number of repetitions [>=1]: ", cfg.repetitions) ||
+        cfg.repetitions < 1)
+    {
+        std::cout << "[WARNING] Invalid repetition count. Configuration cancelled.\n";
+        return;
+    }
+
+    cfg.on_ms = static_cast<int>(std::lround(on_s * 1000.0));
+    cfg.off_ms = static_cast<int>(std::lround(1.5 * cfg.on_ms));
+    rectangular_config = cfg;
+    rectangular_configured = true;
+
+    std::cout << "[FES] Rectangular pattern configured: channel " << cfg.channel
+              << ", " << cfg.current_mA << " mA, " << cfg.frequency_Hz
+              << " Hz, PW " << cfg.pulse_width_us << " us, ON "
+              << cfg.on_ms / 1000.0 << " s, OFF " << cfg.off_ms / 1000.0
+              << " s, repetitions " << cfg.repetitions << ".\n";
+}
+
 void print_menu()
 {
 
@@ -535,7 +1013,7 @@ void print_menu()
 
     std::cout << "\n--- Exercise ---\n";
     std::cout << "7 - START EXERCISE\n";
-    std::cout << "8 - STOP EXERCISE\n";
+    std::cout << "8 - STOP EXO + FES (3 reinitializes FES; 2 -> 7 restarts Exo)\n";
 
     std::cout << "\n--- Safe Exit ---\n";
     std::cout << "\n9 - EXIT\n";
@@ -579,10 +1057,13 @@ void terminal_input()
         switch (selection)
         {
 
+        case RECTANGULAR:
+            configure_rectangular_pattern();
+            break;
+
         case ENABLE_EXO:
         case GO_TO_POSITION:
         case ENABLE_FES:
-        case RECTANGULAR:
         case TRAPEZOIDAL:
         case BIOMIMETIC:
         case START_EXERCISE:
@@ -604,13 +1085,35 @@ void terminal_input()
             }
             else
             {
+                requested_button.store(EXIT);
+
+                // Wait here, not in the control callback. loop() must first
+                // acknowledge that the session cannot resume or use the logger.
+                while (!logger_close_ready.load())
+                    usleep(10000);
+
                 if (logger != nullptr)
                 {
                     logger.reset();
                     std::cout << "[LOGGER] CSV closed.\n";
                 }
 
-                std::cout << "[SYSTEM] Press Ctrl+C to terminate.\n";
+                // The callback has acknowledged closure and cannot access P24 again.
+                if (P24_port_open)
+                {
+                    if (smpt_close_serial_port(&p24_stimulator.stim_device))
+                    {
+                        P24_port_open = false;
+                        std::cout << "[FES] Serial port closed.\n";
+                    }
+                    else
+                    {
+                        std::cerr << "[FES] Serial port close failed; command 9 retries.\n";
+                        break;
+                    }
+                }
+
+                std::cout << "[SYSTEM] Session closed. Press Ctrl+C to terminate.\n";
             }
 
             break;
@@ -624,13 +1127,24 @@ void terminal_input()
 
 int main(void)
 {
+    // Restore the working initialization order from Codice_ok(2).zip:
+    // open /dev/P24 -> ML_Init -> start the Exo threads.
     const char *port_name = "/dev/P24";
     p24_stimulator.stim_device = {0};
-    smpt_open_serial_port(&p24_stimulator.stim_device, port_name);
+    P24_port_open = smpt_open_serial_port(&p24_stimulator.stim_device, port_name);
 
-    P24_initialized = p24_stimulator.init_stimulation(&p24_stimulator.stim_device);
-
-    printf("P24 initialized: %s\n", P24_initialized ? "true" : "false");
+    if (P24_port_open)
+    {
+        P24_initialized = p24_stimulator.init_stimulation(&p24_stimulator.stim_device);
+        fes_stop_ok = !P24_initialized;
+        // The original starts in STIM_WAIT: no ML_Update before an exercise.
+        stim_mode = STIM_WAIT;
+        printf("P24 initialized: %s\n", P24_initialized ? "true" : "false");
+    }
+    else
+    {
+        std::cerr << "[FES] Cannot open /dev/P24 at startup. Command 3 retries.\n";
+    }
 
     start_time_ms = (long long int)get_current_time_ms();
 
@@ -649,7 +1163,7 @@ int main(void)
 
     molla = get_molla_parameters();
 
-    if (molla.hand ==1)
+    if (molla.hand == 1)
         target_pos[2] = -90.0f; // mano sinistra, pollice a 0°
 
     printf("Rigidezza: %f, Offset: %f, Mano: %d\n", molla.k, molla.offset, molla.hand);
