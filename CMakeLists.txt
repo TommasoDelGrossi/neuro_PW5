@@ -21,6 +21,9 @@ add_subdirectory(lib)
 # Main executable
 add_executable(main
     src/main.cpp
+    src/workshop_runtime.cpp
+    src/workshop_console.cpp
+    src/fes_patterns.cpp
     src/utils_exofes.cpp
     src/data_logger.cpp
     src/timer.cpp
